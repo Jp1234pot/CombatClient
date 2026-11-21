@@ -457,13 +457,18 @@ local CombatConfig = {
 	LockHoldSeconds = 0.2,
 	CameraPriorityOffset = 1,
 
-	HighlightEnabled = false,
+	HighlightPlayers = false,
+	HighlightNPCs = false,
 	MaxDistance = 500,
 	ThroughWalls = true,
-	FillColor = Color3.fromRGB(255, 65, 65),
-	OutlineColor = Color3.fromRGB(255, 255, 255),
 	FillTransparency = 0.85,
 	OutlineTransparency = 0,
+	HighlightColors = {
+		NPC = Color3.fromRGB(255, 140, 0),
+		Enemy = Color3.fromRGB(255, 65, 65),
+		Teammate = Color3.fromRGB(65, 145, 255),
+		Unregistered = Color3.fromRGB(245, 245, 245),
+	},
 }
 
 local CombatSessionId = Services.HttpService:GenerateGUID(false)
@@ -714,8 +719,106 @@ local function clearAllCombatHighlights()
 	end
 end
 
+local function getPlayerHighlightCategory(player)
+	if not player then
+		return "Unregistered"
+	end
+
+	local localTeam = LocalPlayer and LocalPlayer.Team
+	local playerTeam = player.Team
+
+	if localTeam == nil or playerTeam == nil then
+		return "Unregistered"
+	end
+
+	if playerTeam == localTeam then
+		return "Teammate"
+	end
+
+	return "Enemy"
+end
+
+local function getHighlightCandidates(maxDist, myPos)
+	local candidates = {}
+	local seenModels = {}
+	local localChar = LocalPlayer and LocalPlayer.Character
+
+	if CombatConfig.HighlightPlayers then
+		for _, player in ipairs(Services.Players:GetPlayers()) do
+			if player == LocalPlayer then
+				continue
+			end
+
+			local char = player.Character
+			local root = getCombatCharacterRoot(char)
+			if char and root and not seenModels[char] and isAliveCombatCharacter(char) then
+				if (root.Position - myPos).Magnitude <= maxDist then
+					seenModels[char] = true
+					table.insert(candidates, {
+						Character = char,
+						Color = CombatConfig.HighlightColors[getPlayerHighlightCategory(player)],
+					})
+				end
+			end
+		end
+	end
+
+	if CombatConfig.HighlightNPCs then
+		for _, child in ipairs(Services.Workspace:GetChildren()) do
+			if child:IsA("Model") and child ~= localChar and not seenModels[child] then
+				if getPlayerFromCombatCharacter(child) == nil and isAliveCombatCharacter(child) then
+					local root = getCombatCharacterRoot(child)
+					if root and (root.Position - myPos).Magnitude <= maxDist then
+						seenModels[child] = true
+						table.insert(candidates, {
+							Character = child,
+							Color = CombatConfig.HighlightColors.NPC,
+						})
+					end
+				end
+			end
+		end
+	end
+
+	return candidates
+end
+
+local function syncCharacterHighlight(character, color)
+	local existing = CombatHighlights[character]
+	if existing and not isOwnCombatHighlight(existing.Instance) then
+		clearCombatCharacterHighlight(character)
+		existing = nil
+	end
+
+	local hl = existing and existing.Instance
+	if not hl then
+		hl = Instance.new("Highlight")
+		hl.Name = CombatHighlightName
+		hl:SetAttribute(CombatSessionAttr, CombatSessionId)
+		hl.Adornee = character
+		hl.Parent = character
+		TrackObject(hl)
+
+		CombatHighlights[character] = {
+			Instance = hl,
+			Character = character,
+		}
+	end
+
+	hl.DepthMode = CombatConfig.ThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
+	hl.FillColor = color
+	hl.OutlineColor = color
+	hl.FillTransparency = CombatConfig.FillTransparency
+	hl.OutlineTransparency = CombatConfig.OutlineTransparency
+end
+
 local function updateCombatHighlights()
-	if not CombatActive or not CombatConfig.HighlightEnabled or not isLocalCombatPlayerAlive() then
+	if not CombatActive or not isLocalCombatPlayerAlive() then
+		clearAllCombatHighlights()
+		return
+	end
+
+	if not (CombatConfig.HighlightPlayers or CombatConfig.HighlightNPCs) then
 		clearAllCombatHighlights()
 		return
 	end
@@ -727,47 +830,12 @@ local function updateCombatHighlights()
 	end
 
 	local myPos = myRoot.Position
+	local maxDist = CombatConfig.MaxDistance
 	local validSet = {}
-	local candidates = getCombatCandidateModels()
 
-	for _, entry in ipairs(candidates) do
-		local character = entry.Character
-		local root = getCombatCharacterRoot(character)
-		if not character or not root then
-			continue
-		end
-
-		if (root.Position - myPos).Magnitude > CombatConfig.MaxDistance then
-			continue
-		end
-
-		validSet[character] = true
-
-		local existing = CombatHighlights[character]
-		if existing and not isOwnCombatHighlight(existing.Instance) then
-			clearCombatCharacterHighlight(character)
-			existing = nil
-		end
-
-		if not existing then
-			local hl = Instance.new("Highlight")
-			hl.Name = CombatHighlightName
-			hl:SetAttribute(CombatSessionAttr, CombatSessionId)
-			hl.Adornee = character
-			hl.DepthMode = CombatConfig.ThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
-			hl.FillColor = CombatConfig.FillColor
-			hl.OutlineColor = CombatConfig.OutlineColor
-			hl.FillTransparency = CombatConfig.FillTransparency
-			hl.OutlineTransparency = CombatConfig.OutlineTransparency
-			hl.Parent = character
-
-			TrackObject(hl)
-
-			CombatHighlights[character] = {
-				Instance = hl,
-				Character = character,
-			}
-		end
+	for _, item in ipairs(getHighlightCandidates(maxDist, myPos)) do
+		validSet[item.Character] = true
+		syncCharacterHighlight(item.Character, item.Color)
 	end
 
 	for char in pairs(CombatHighlights) do
@@ -1231,14 +1299,25 @@ end)
 
 --// Combat Highlights (Visuals)
 
-Groupboxes.Visuals:AddToggle("CombatHighlightEnabled", {
-	Text = "Combat Highlights",
-	Default = CombatConfig.HighlightEnabled,
-	Tooltip = "Highlights valid combat targets within range."
+Groupboxes.Visuals:AddToggle("HighlightPlayersToggle", {
+	Text = "Highlight Players",
+	Default = CombatConfig.HighlightPlayers,
+	Tooltip = "ESP/Chams players (Red = enemy, Blue = team, White = no team)."
 })
 
-Toggles.CombatHighlightEnabled:OnChanged(function(Value)
-	CombatConfig.HighlightEnabled = Value
+Toggles.HighlightPlayersToggle:OnChanged(function(Value)
+	CombatConfig.HighlightPlayers = Value
+	updateCombatHighlights()
+end)
+
+Groupboxes.Visuals:AddToggle("HighlightNPCsToggle", {
+	Text = "Highlight NPCs",
+	Default = CombatConfig.HighlightNPCs,
+	Tooltip = "ESP/Chams NPCs in orange."
+})
+
+Toggles.HighlightNPCsToggle:OnChanged(function(Value)
+	CombatConfig.HighlightNPCs = Value
 	updateCombatHighlights()
 end)
 
@@ -1363,7 +1442,8 @@ end)
 Library:OnUnload(function()
 	CombatActive = false
 	CombatConfig.AssistEnabled = false
-	CombatConfig.HighlightEnabled = false
+	CombatConfig.HighlightPlayers = false
+	CombatConfig.HighlightNPCs = false
 	resetCombatLockState()
 
 	pcall(function()
