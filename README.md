@@ -3,8 +3,6 @@ Modular Luau and target-assist system.  Use at your own risks.
 
 # SmartCamera-CombatClient
 
-# SmartCamera-CombatClient
-
 A modular Luau camera and target-assist controller integrated with the **Obsidian** UI library.
 
 ## Features
