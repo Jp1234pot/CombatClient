@@ -174,6 +174,17 @@ local function isEnemyPlayer(player)
 	return true
 end
 
+local function isModelAllowedByFilters(model)
+	if not model or model == (LocalPlayer and LocalPlayer.Character) or not isAliveCharacter(model) then
+		return false
+	end
+	local plr = getPlayerFromCharacter(model)
+	if plr then
+		return Config.TargetPlayers == true and isEnemyPlayer(plr)
+	end
+	return Config.TargetNPCs == true
+end
+
 local function getCandidateModels()
 	local entries = {}
 	local seenModels = {}
@@ -447,10 +458,13 @@ function CombatClient.GetAssistTarget(origin, direction)
 		return lockedEntryTarget
 	end
 
-	-- Grace hold across brief angle/wall flickers while target remains alive & in range
-	if LockState.Character and isAliveCharacter(LockState.Character) and (now - LockState.LastValidAt) <= Config.LockHoldSeconds then
+	-- Grace hold across brief angle/wall flickers while target remains valid, alive & in range
+	if LockState.Character
+		and isModelAllowedByFilters(LockState.Character)
+		and (now - LockState.LastValidAt) <= Config.LockHoldSeconds
+	then
 		local aimPart = getAimPart(LockState.Character)
-		if aimPart then
+		if aimPart and (not checkWalls or isClearOfWalls(origin, aimPart, LockState.Character)) then
 			local offset = aimPart.Position - origin
 			local dist = offset.Magnitude
 			if dist >= 0.001 and dist <= maxDist then
@@ -463,7 +477,7 @@ function CombatClient.GetAssistTarget(origin, direction)
 					Part = aimPart,
 					Position = aimPart.Position,
 					Distance = dist,
-					AngleDegrees = math.deg(math.acos(math.clamp(unitDir:Dot(offset.Unit), -1, 1))),
+					AngleDegrees = math.deg(math.acos(math.clamp(unitDir:Dot(offset / dist), -1, 1))),
 					Score = 0,
 				}
 			end
