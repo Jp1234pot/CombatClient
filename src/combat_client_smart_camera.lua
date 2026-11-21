@@ -2,6 +2,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local LocalizationService = game:GetService("LocalizationService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
@@ -45,6 +46,15 @@ end
 
 local CombatClient = {}
 
+local BAD_BUSINESS_PLACE_IDS = {
+	[11379161761] = true,
+	[3233893879] = true,
+}
+
+local function isBadBusinessPlace()
+	return BAD_BUSINESS_PLACE_IDS[game.PlaceId] == true
+end
+
 local SESSION_ID = HttpService:GenerateGUID(false)
 local SESSION_ATTR = "CombatClientSession"
 local HIGHLIGHT_NAME = "CombatClientHighlight"
@@ -58,7 +68,7 @@ local DEFAULTS = {
 	MaxDistance = 500,
 	ThroughWalls = true,
 	FillColor = Color3.fromRGB(255, 65, 65),
-	OutlineColor = Color3.fromRGB(255, 255, 255),
+	OutlineColor = Color3.fromRGB(255, 45, 45),
 	FillTransparency = 0.85,
 	OutlineTransparency = 0,
 
@@ -75,16 +85,32 @@ local DEFAULTS = {
 	LockHoldSeconds = 0.2,
 	CameraPriorityOffset = 1,
 
+	-- Game-specific feature flags (Bad Business)
+	BBChamsEnabled = true,
+	BBMaxDistance = 600,
+	BBThroughWalls = true,
+
 	DebugLogs = true,
 }
 
 local Config = {}
 local Connections = {}
 local Highlights = {}
+local BBHighlights = {}
 local HookedOriginals = {}
 local Initialized = false
 local HookBusy = false
 local HighlightAccum = 0
+local BBAccum = 0
+
+local TS = nil
+pcall(function()
+	local tsModule = ReplicatedStorage:FindFirstChild("TS")
+	if tsModule and typeof(require) == "function" then
+		local loaded = require(tsModule)
+		TS = typeof(loaded) == "function" and loaded() or loaded
+	end
+end)
 
 local LockState = {
 	Character = nil,
@@ -266,12 +292,10 @@ local function computePriorityScore(dist, angleDeg, maxDist, maxAngleDeg, isCurr
 	local stickBonus = isCurrentLock and -0.12 or 0
 
 	if Config.PriorityMode == "Nearest" then
-		-- Lower score = higher priority
 		return normDist + (normAngle * 0.2) + stickBonus
 	elseif Config.PriorityMode == "Crosshair" then
 		return normAngle + (normDist * 0.2) + stickBonus
 	else
-		-- "Smart": balances proximity and crosshair alignment
 		return (normAngle * 0.55) + (normDist * 0.45) + stickBonus
 	end
 end
@@ -373,6 +397,178 @@ local function updateHighlights()
 	end
 end
 
+-- ===================== BAD BUSINESS FEATURED CHAMS =====================
+local function clearBBModelHighlight(model)
+	local hl = BBHighlights[model]
+	if hl then
+		if hl.Parent and isOwnHighlight(hl) then
+			hl:Destroy()
+		end
+		BBHighlights[model] = nil
+	end
+	if model and model.Parent then
+		for _, child in ipairs(model:GetChildren()) do
+			if isOwnHighlight(child) then
+				child:Destroy()
+			end
+		end
+	end
+end
+
+local function clearAllBBHighlights()
+	for model in pairs(BBHighlights) do
+		clearBBModelHighlight(model)
+	end
+end
+
+local function isBBModelAlive(model)
+	if not model or not model:IsA("Model") or model.Parent == nil then
+		return false
+	end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health <= 0 then
+		return false
+	end
+	local healthAttr = model:GetAttribute("Health")
+	if typeof(healthAttr) == "number" and healthAttr <= 0 then
+		return false
+	end
+	return true
+end
+
+local function getBBLocalTeam()
+	if LocalPlayer and LocalPlayer.Team then
+		return LocalPlayer.Team
+	end
+	local attrTeam = LocalPlayer and (LocalPlayer:GetAttribute("Team") or LocalPlayer:GetAttribute("TeamName"))
+	if attrTeam ~= nil then
+		return attrTeam
+	end
+	local myChar = LocalPlayer and LocalPlayer.Character
+	if myChar then
+		return myChar:GetAttribute("Team") or myChar:GetAttribute("TeamName")
+	end
+	return nil
+end
+
+local function isBBEnemyModel(model)
+	if not model or not model:IsA("Model") then
+		return false
+	end
+	local myChar = LocalPlayer and LocalPlayer.Character
+	if model == myChar then
+		return false
+	end
+	local plr = Players:GetPlayerFromCharacter(model)
+	if plr == LocalPlayer then
+		return false
+	end
+	if TS and typeof(TS.Teams) == "table" and typeof(TS.Teams.IsEnemy) == "function" then
+		local ok, enemy = pcall(TS.Teams.IsEnemy, TS.Teams, model)
+		if ok and typeof(enemy) == "boolean" then
+			return enemy
+		end
+	end
+	local modelTeam = model:GetAttribute("Team") or model:GetAttribute("TeamName")
+	local myTeam = getBBLocalTeam()
+	if modelTeam ~= nil and myTeam ~= nil then
+		return tostring(modelTeam) ~= tostring(myTeam)
+	end
+	if plr and LocalPlayer and LocalPlayer.Team and plr.Team then
+		return plr.Team ~= LocalPlayer.Team
+	end
+	return true
+end
+
+local function collectBBEnemyModels()
+	local found = {}
+	local seen = {}
+
+	if TS and typeof(TS.Characters) == "table" and typeof(TS.Characters.GetCharacters) == "function" then
+		local ok, chars = pcall(TS.Characters.GetCharacters, TS.Characters)
+		if ok and typeof(chars) == "table" then
+			for _, item in pairs(chars) do
+				local model = typeof(item) == "Instance" and item or (typeof(item) == "table" and (item.Character or item.Model))
+				if typeof(model) == "Instance" and model:IsA("Model") and not seen[model] then
+					seen[model] = true
+					if isBBModelAlive(model) and isBBEnemyModel(model) then
+						table.insert(found, model)
+					end
+				end
+			end
+			if #found > 0 then
+				return found
+			end
+		end
+	end
+
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("Model") and not seen[obj] then
+			if obj:FindFirstChild("Root") or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildOfClass("Humanoid") then
+				seen[obj] = true
+				if isBBModelAlive(obj) and isBBEnemyModel(obj) then
+					table.insert(found, obj)
+				end
+			end
+		end
+	end
+
+	return found
+end
+
+local function updateBadBusinessChams()
+	if not Initialized or not isBadBusinessPlace() or not Config.BBChamsEnabled then
+		clearAllBBHighlights()
+		return
+	end
+
+	local myChar = LocalPlayer and LocalPlayer.Character
+	local myAnchor = getCharacterRoot(myChar)
+	local myPos = myAnchor and myAnchor.Position or (Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position)
+	if not myPos then
+		return
+	end
+
+	local enemies = collectBBEnemyModels()
+	local validSet = {}
+
+	for _, model in ipairs(enemies) do
+		local anchor = getCharacterRoot(model)
+		if not anchor then
+			continue
+		end
+		if (anchor.Position - myPos).Magnitude > Config.BBMaxDistance then
+			continue
+		end
+
+		validSet[model] = true
+
+		local hl = BBHighlights[model]
+		if not hl or not hl.Parent or not isOwnHighlight(hl) then
+			clearBBModelHighlight(model)
+			hl = Instance.new("Highlight")
+			hl.Name = HIGHLIGHT_NAME
+			hl:SetAttribute(SESSION_ATTR, SESSION_ID)
+			hl.Adornee = model
+			hl.Parent = model
+			BBHighlights[model] = hl
+		end
+
+		hl.DepthMode = Config.BBThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
+		hl.FillColor = Config.FillColor
+		hl.OutlineColor = Color3.fromRGB(255, 45, 45)
+		hl.FillTransparency = Config.FillTransparency
+		hl.OutlineTransparency = Config.OutlineTransparency
+	end
+
+	for model in pairs(BBHighlights) do
+		if not validSet[model] then
+			clearBBModelHighlight(model)
+		end
+	end
+end
+-- =====================================================================
+
 function CombatClient.GetAssistTarget(origin, direction)
 	if not Initialized or not Config.AssistEnabled or not isLocalPlayerAlive() then
 		resetLockState()
@@ -458,7 +654,6 @@ function CombatClient.GetAssistTarget(origin, direction)
 		return lockedEntryTarget
 	end
 
-	-- Grace hold across brief angle/wall flickers while target remains valid, alive & in range
 	if LockState.Character
 		and isModelAllowedByFilters(LockState.Character)
 		and (now - LockState.LastValidAt) <= Config.LockHoldSeconds
@@ -638,6 +833,7 @@ function CombatClient.SetConfig(partial)
 	end
 	if Initialized then
 		updateHighlights()
+		updateBadBusinessChams()
 	end
 end
 
@@ -656,6 +852,7 @@ function CombatClient.Destroy()
 	end
 	table.clear(Connections)
 	clearAllHighlights()
+	clearAllBBHighlights()
 	log("Destroyed.")
 end
 
@@ -683,7 +880,10 @@ function CombatClient.Init(userConfig)
 		table.insert(Connections, LocalPlayer.CharacterAdded:Connect(function()
 			resetLockState()
 			if Initialized then
-				task.defer(updateHighlights)
+				task.defer(function()
+					updateHighlights()
+					updateBadBusinessChams()
+				end)
 			end
 		end))
 	end
@@ -694,6 +894,7 @@ function CombatClient.Init(userConfig)
 		end
 		if player.Character then
 			clearCharacterHighlight(player.Character)
+			clearBBModelHighlight(player.Character)
 		end
 	end))
 
@@ -706,6 +907,14 @@ function CombatClient.Init(userConfig)
 			HighlightAccum = 0
 			updateHighlights()
 		end
+
+		if isBadBusinessPlace() then
+			BBAccum += dt
+			if BBAccum >= 0.25 then
+				BBAccum = 0
+				updateBadBusinessChams()
+			end
+		end
 	end))
 
 	RunService:BindToRenderStep(
@@ -715,7 +924,8 @@ function CombatClient.Init(userConfig)
 	)
 
 	updateHighlights()
-	log("Initialized | Mode:", Config.Mode, "| Priority:", Config.PriorityMode, "| Session:", SESSION_ID)
+	updateBadBusinessChams()
+	log("Initialized | PlaceId:", game.PlaceId, "| BadBusiness:", isBadBusinessPlace(), "| Mode:", Config.Mode, "| Priority:", Config.PriorityMode)
 	return CombatClient
 end
 
@@ -742,7 +952,7 @@ local Options = Library.Options
 
 local Window = Library:CreateWindow({
 	Title = "CombatClient",
-	Footer = "Smart Camera | Obsidian UI",
+	Footer = isBadBusinessPlace() and "Featured: Bad Business | Obsidian UI" or "Smart Camera | Obsidian UI",
 	ToggleKeybind = Enum.KeyCode.RightShift,
 	NotifySide = "Right",
 	ShowCustomCursor = false,
@@ -908,6 +1118,48 @@ EspBox:AddSlider("EspMaxDist", {
 		CombatClient.SetConfig({ MaxDistance = val })
 	end,
 })
+
+-- Separated Featured Game Section for Bad Business (PlaceIds: 11379161761, 3233893879)
+if isBadBusinessPlace() then
+	local FeaturedTab = Window:AddTab({
+		Name = "Featured",
+		Description = "Bad Business Game Features",
+		Icon = "flame",
+	})
+
+	local BBBox = FeaturedTab:AddLeftGroupbox("Bad Business", "shield-alert")
+
+	BBBox:AddLabel("Featured Game Detected: Bad Business", true)
+
+	BBBox:AddToggle("BBChamsEnabled", {
+		Text = "Bad Business Chams",
+		Default = Config.BBChamsEnabled,
+		Callback = function(val)
+			CombatClient.SetConfig({ BBChamsEnabled = val })
+		end,
+	})
+
+	BBBox:AddToggle("BBThroughWalls", {
+		Text = "Chams Through Walls",
+		Default = Config.BBThroughWalls,
+		Callback = function(val)
+			CombatClient.SetConfig({ BBThroughWalls = val })
+			clearAllBBHighlights()
+			updateBadBusinessChams()
+		end,
+	})
+
+	BBBox:AddSlider("BBMaxDist", {
+		Text = "Chams Max Distance",
+		Default = Config.BBMaxDistance,
+		Min = 50,
+		Max = 1500,
+		Rounding = 0,
+		Callback = function(val)
+			CombatClient.SetConfig({ BBMaxDistance = val })
+		end,
+	})
+end
 
 SystemBox:AddButton({
 	Text = "Unload & Cleanup",
