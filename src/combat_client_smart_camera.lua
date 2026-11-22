@@ -63,8 +63,26 @@ local function getExecutorFn(name)
 	return (ok and typeof(gFn) == "function") and gFn or nil
 end
 
+local fnHookFunction = getExecutorFn("hookfunction")
 local fnNewCClosure = getExecutorFn("newcclosure")
+local fnCheckCaller = getExecutorFn("checkcaller")
 local fnSetFpsCap = getExecutorFn("setfpscap") or getExecutorFn("set_fps_cap")
+
+local function wrapCClosure(fn)
+	if not fnNewCClosure then
+		return fn
+	end
+	local ok, wrapped = pcall(fnNewCClosure, fn)
+	return (ok and typeof(wrapped) == "function") and wrapped or fn
+end
+
+local function isOwnCaller()
+	if not fnCheckCaller then
+		return false
+	end
+	local ok, res = pcall(fnCheckCaller)
+	return ok and res == true
+end
 
 if env.CombatClient and typeof(env.CombatClient.Destroy) == "function" then
 	pcall(function()
@@ -104,9 +122,15 @@ local DEFAULTS = {
 	IgnoreSameTeam = true,
 	PreferHead = true,
 
-	CameraSmoothness = 0.25,
-	LockHoldSeconds = 0.15,
+	-- Camera & target stickiness (reduces cursor fighting in crowds)
+	CameraSmoothness = 0.22,
+	LockHoldSeconds = 0.14,
+	LockSwitchMargin = 0.18, -- New target must beat current locked target's score by this much
+	CameraDeadzoneDegrees = 1.25, -- Stops micro-jitter when already aligned
 	CameraPriorityOffset = 1,
+
+	-- Silent aim general raycast tuning
+	SilentAimMaxAngleDegrees = 20,
 
 	FPSControlEnabled = false,
 	FPSCap = 120,
@@ -116,11 +140,16 @@ local DEFAULTS = {
 
 local Config = {}
 local Connections = {}
-local Highlights = {} -- [model] = { Instance = Highlight, Role = "enemy" | "teammate" }
-local TraceTimers = {} -- [tag] = lastClock
+local Highlights = {}
+local TraceTimers = {}
 local Initialized = false
 local BoundPriority = nil
 local HighlightAccum = 0
+
+local HookInstalled = false
+local HookActive = false
+local HookBusy = false
+local OriginalRaycast = nil
 
 local WallRayParams = RaycastParams.new()
 WallRayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -357,34 +386,65 @@ local function syncWallIgnoreList()
 	WallRayParams.FilterDescendantsInstances = WallIgnoreCache
 end
 
+-- Checks if a part blocks line-of-sight (catches invisible solid barriers, skips invisible non-collidable parts)
+local function isPartOccludingBarrier(part)
+	if not part or not part:IsA("BasePart") then
+		return false
+	end
+	if part.CanCollide then
+		return true
+	end
+	if part.Transparency >= 0.98 then
+		return false
+	end
+	return part.CanQuery ~= false
+end
+
 local function isClearOfWalls(origin, targetPart, targetCharacter)
 	if not targetPart or not targetPart.Parent then
 		return false
 	end
 	syncWallIgnoreList()
-	local delta = targetPart.Position - origin
-	if delta.Magnitude < 0.001 then
-		return true
-	end
-	local result = Workspace:Raycast(origin, delta, WallRayParams)
-	if not result then
-		return true
-	end
+
 	local model = targetCharacter or targetPart:FindFirstAncestorOfClass("Model")
-	return model ~= nil and result.Instance:IsDescendantOf(model)
+	local currentOrigin = origin
+	local remaining = targetPart.Position - currentOrigin
+	local maxSteps = 5
+
+	for _ = 1, maxSteps do
+		local dist = remaining.Magnitude
+		if dist < 0.001 then
+			return true
+		end
+		local result = Workspace:Raycast(currentOrigin, remaining, WallRayParams)
+		if not result then
+			return true
+		end
+		if model and result.Instance:IsDescendantOf(model) then
+			return true
+		end
+		if isPartOccludingBarrier(result.Instance) then
+			return false
+		end
+		-- Step just past non-occluding decor/glass/trigger parts
+		local stepDir = remaining.Unit
+		currentOrigin = result.Position + (stepDir * 0.05)
+		remaining = targetPart.Position - currentOrigin
+	end
+
+	return false
 end
 
-local function computePriorityScore(dist, angleDeg, maxDist, maxAngleDeg, isLocked)
+local function computePriorityScore(dist, angleDeg, maxDist, maxAngleDeg)
 	local normDist = math.clamp(dist / math.max(maxDist, 1), 0, 1)
 	local normAngle = math.clamp(angleDeg / math.max(maxAngleDeg, 1), 0, 1)
-	local stickBonus = isLocked and -0.12 or 0
 
 	if Config.PriorityMode == "Nearest" then
-		return normDist + (normAngle * 0.2) + stickBonus
+		return normDist + (normAngle * 0.2)
 	elseif Config.PriorityMode == "Crosshair" then
-		return normAngle + (normDist * 0.2) + stickBonus
+		return normAngle + (normDist * 0.2)
 	end
-	return (normAngle * 0.55) + (normDist * 0.45) + stickBonus
+	return (normAngle * 0.6) + (normDist * 0.4)
 end
 
 local function isOwnHighlight(inst, expectedName)
@@ -496,7 +556,21 @@ local function updateHighlights()
 	end
 end
 
-function CombatClient.GetAssistTarget(origin, direction)
+local function buildTargetInfo(entry, character, aimPart, origin, unitDir, dist, angleDeg, score)
+	return {
+		Player = entry.Player,
+		Character = character,
+		Name = entry.Name,
+		IsNPC = entry.IsNPC,
+		Part = aimPart,
+		Position = aimPart.Position,
+		Distance = dist,
+		AngleDegrees = angleDeg,
+		Score = score,
+	}
+end
+
+function CombatClient.GetAssistTarget(origin, direction, maxAngleOverride)
 	if not Initialized or not Config.AssistEnabled or Config.Mode == "Off" or not isLocalPlayerAlive() then
 		resetLockState()
 		return nil
@@ -506,16 +580,17 @@ function CombatClient.GetAssistTarget(origin, direction)
 	end
 
 	local unitDir = direction.Unit
-	local maxAngleRad = math.rad(Config.AssistMaxAngleDegrees)
+	local maxAngleDeg = math.max(tonumber(maxAngleOverride) or Config.AssistMaxAngleDegrees, 1)
+	local maxAngleRad = math.rad(maxAngleDeg)
 	local maxDist = Config.AssistMaxDistance
 	local maxDistSq = maxDist * maxDist
 	local candidates = getCandidateModels(false)
 	local checkWalls = Config.WallCheck == true
+	local switchMargin = math.max(tonumber(Config.LockSwitchMargin) or 0, 0)
 	local now = os.clock()
 
-	local bestTarget = nil
-	local bestScore = math.huge
-	local lockedTarget = nil
+	local bestCandidate = nil
+	local currentLockedCandidate = nil
 
 	for _, entry in ipairs(candidates) do
 		local character = entry.Character
@@ -547,42 +622,39 @@ function CombatClient.GetAssistTarget(origin, direction)
 		end
 
 		local angleDeg = math.deg(angle)
-		local isLocked = (LockState.Character == character)
-		local score = computePriorityScore(dist, angleDeg, maxDist, Config.AssistMaxAngleDegrees, isLocked)
+		local score = computePriorityScore(dist, angleDeg, maxDist, maxAngleDeg)
+		local built = buildTargetInfo(entry, character, aimPart, origin, unitDir, dist, angleDeg, score)
 
-		local built = {
-			Player = entry.Player,
-			Character = character,
-			Name = entry.Name,
-			IsNPC = entry.IsNPC,
-			Part = aimPart,
-			Position = aimPart.Position,
-			Distance = dist,
-			AngleDegrees = angleDeg,
-			Score = score,
-		}
-
-		if isLocked then
-			lockedTarget = built
+		if character == LockState.Character then
+			currentLockedCandidate = built
 		end
-		if score < bestScore then
-			bestScore = score
-			bestTarget = built
+		if not bestCandidate or score < bestCandidate.Score then
+			bestCandidate = built
 		end
 	end
 
-	if bestTarget then
-		LockState.Character = bestTarget.Character
+	-- Hysteresis: keep current target unless a challenger beats it by LockSwitchMargin
+	if currentLockedCandidate then
+		if bestCandidate and bestCandidate.Character ~= currentLockedCandidate.Character then
+			if (bestCandidate.Score + switchMargin) < currentLockedCandidate.Score then
+				LockState.Character = bestCandidate.Character
+				LockState.LastValidAt = now
+				return bestCandidate
+			end
+		end
+		LockState.Character = currentLockedCandidate.Character
 		LockState.LastValidAt = now
-		traceThrottled("Target", 0.5, "Selected:", bestTarget.Name, string.format("%.1f studs", bestTarget.Distance))
-		return bestTarget
+		return currentLockedCandidate
 	end
 
-	if lockedTarget then
+	if bestCandidate then
+		LockState.Character = bestCandidate.Character
 		LockState.LastValidAt = now
-		return lockedTarget
+		traceThrottled("Target", 0.5, "Selected:", bestCandidate.Name, string.format("%.1f studs", bestCandidate.Distance))
+		return bestCandidate
 	end
 
+	-- Hold briefly if target momentarily flickers
 	if LockState.Character and isAliveCharacter(LockState.Character) and (now - LockState.LastValidAt) <= Config.LockHoldSeconds then
 		local aimPart = getAimPart(LockState.Character)
 		if aimPart and (not checkWalls or isClearOfWalls(origin, aimPart, LockState.Character)) then
@@ -590,17 +662,13 @@ function CombatClient.GetAssistTarget(origin, direction)
 			local dist = offset.Magnitude
 			if dist >= 0.001 and dist <= maxDist then
 				local plr = getPlayerFromModel(LockState.Character)
-				return {
+				local angleDeg = math.deg(math.acos(math.clamp(unitDir:Dot(offset / dist), -1, 1)))
+				return buildTargetInfo({
 					Player = plr,
 					Character = LockState.Character,
 					Name = plr and plr.Name or LockState.Character.Name,
 					IsNPC = plr == nil,
-					Part = aimPart,
-					Position = aimPart.Position,
-					Distance = dist,
-					AngleDegrees = math.deg(math.acos(math.clamp(unitDir:Dot(offset / dist), -1, 1))),
-					Score = 0,
-				}
+				}, LockState.Character, aimPart, origin, unitDir, dist, angleDeg, 0)
 			end
 		end
 	end
@@ -609,14 +677,14 @@ function CombatClient.GetAssistTarget(origin, direction)
 	return nil
 end
 
-function CombatClient.GetAdjustedDirection(origin, direction)
+function CombatClient.GetAdjustedDirection(origin, direction, maxAngleOverride)
 	if not Initialized or not Config.AssistEnabled or Config.Mode == "Off" or not isLocalPlayerAlive() then
 		return direction
 	end
 	if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then
 		return direction
 	end
-	local cand = CombatClient.GetAssistTarget(origin, direction)
+	local cand = CombatClient.GetAssistTarget(origin, direction, maxAngleOverride)
 	if not cand or not cand.Position then
 		return direction
 	end
@@ -646,19 +714,68 @@ local function stepSmartCamera(dt)
 	end
 
 	local origin = cam.CFrame.Position
-	local cand = CombatClient.GetAssistTarget(origin, cam.CFrame.LookVector)
+	local look = cam.CFrame.LookVector
+	local cand = CombatClient.GetAssistTarget(origin, look)
 	if not cand or not cand.Position then
 		return
 	end
 
-	local maxSmooth = isBadBusinessPlace() and 0.14 or 0.45
-	local smooth = math.min(Config.CameraSmoothness, maxSmooth)
-	local alpha = math.clamp(1 - ((1 - smooth) ^ (dt * 60)), 0, maxSmooth)
+	-- Deadzone prevents cursor tugging when already close to the target
+	local deadzone = math.max(tonumber(Config.CameraDeadzoneDegrees) or 0, 0)
+	if cand.AngleDegrees <= deadzone then
+		return
+	end
+
+	local clampedDt = math.clamp(dt or 0.016, 0, 0.1)
+	local smooth = math.clamp(tonumber(Config.CameraSmoothness) or 0.2, 0.01, 1)
+	local alpha = math.clamp(1 - ((1 - smooth) ^ (clampedDt * 60)), 0, 0.65)
 
 	local currentCf = cam.CFrame
 	local targetCf = CFrame.lookAt(currentCf.Position, cand.Position)
 	local rx, ry, rz = currentCf:ToObjectSpace(targetCf):ToEulerAnglesYXZ()
 	cam.CFrame = currentCf * CFrame.fromEulerAnglesYXZ(rx * alpha, ry * alpha, rz * alpha)
+end
+
+local function installGeneralHooksOnce()
+	if HookInstalled then
+		return
+	end
+	if not fnHookFunction or typeof(Workspace.Raycast) ~= "function" then
+		log("hookfunction unavailable or Workspace.Raycast not hookable; SilentAim raycast hook skipped.")
+		return
+	end
+
+	local oldRaycast
+	local ok = pcall(function()
+		oldRaycast = fnHookFunction(Workspace.Raycast, wrapCClosure(function(ws, origin, direction, params)
+			if not HookActive or HookBusy or isOwnCaller() then
+				return oldRaycast(ws, origin, direction, params)
+			end
+			if ws ~= Workspace or not CombatClient.IsSilentAimActive() then
+				return oldRaycast(ws, origin, direction, params)
+			end
+			if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then
+				return oldRaycast(ws, origin, direction, params)
+			end
+
+			HookBusy = true
+			local okAdj, adjDir = pcall(CombatClient.GetAdjustedDirection, origin, direction, Config.SilentAimMaxAngleDegrees)
+			HookBusy = false
+
+			if okAdj and typeof(adjDir) == "Vector3" and adjDir.Magnitude > 0.001 then
+				return oldRaycast(ws, origin, adjDir, params)
+			end
+			return oldRaycast(ws, origin, direction, params)
+		end))
+	end)
+
+	if ok and typeof(oldRaycast) == "function" then
+		OriginalRaycast = oldRaycast
+		HookInstalled = true
+		log("General SilentAim hook installed (Workspace.Raycast).")
+	else
+		log("Failed installing Workspace.Raycast hook:", tostring(oldRaycast))
+	end
 end
 
 local function bindCameraStep()
@@ -706,6 +823,8 @@ end
 
 function CombatClient.Destroy()
 	Initialized = false
+	HookActive = false
+	HookBusy = false
 	BoundPriority = nil
 	CachedIgnoreChar = nil
 	CachedIgnoreCam = nil
@@ -746,7 +865,9 @@ function CombatClient.Init(userConfig)
 	end
 
 	Initialized = true
+	HookActive = true
 	applyFpsCap()
+	installGeneralHooksOnce()
 	bindCameraStep()
 
 	if LocalPlayer then
@@ -794,7 +915,7 @@ env.PremiumCombat = CombatClient
 _G.CombatClient = CombatClient
 _G.PremiumCombat = CombatClient
 
--- ===================== OBSIDIAN UI (UNIFIED) =====================
+-- ===================== OBSIDIAN UI =====================
 task.spawn(function()
 	local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
 	local okFetch, rawSrc = pcall(function()
@@ -814,7 +935,7 @@ task.spawn(function()
 
 	local Window = Library:CreateWindow({
 		Title = "CombatClient",
-		Footer = isBadBusinessPlace() and "Bad Business | Obsidian UI" or "Universal | Obsidian UI",
+		Footer = "Universal | Obsidian UI",
 		ToggleKeybind = Enum.KeyCode.RightShift,
 		NotifySide = "Right",
 		ShowCustomCursor = false,
@@ -884,6 +1005,16 @@ task.spawn(function()
 			CombatClient.SetConfig({ LockHoldSeconds = v })
 		end,
 	})
+	AimBox:AddSlider("SilentAimFOV", {
+		Text = "Silent Aim FOV (Deg)",
+		Default = Config.SilentAimMaxAngleDegrees,
+		Min = 1,
+		Max = 90,
+		Rounding = 0,
+		Callback = function(v)
+			CombatClient.SetConfig({ SilentAimMaxAngleDegrees = v })
+		end,
+	})
 
 	FilterBox:AddToggle("TargetPlayers", {
 		Text = "Target Players",
@@ -941,7 +1072,6 @@ task.spawn(function()
 		end,
 	})
 
-	-- Unified Chams / Highlights (works for both general & Bad Business roles)
 	EspBox:AddToggle("HighlightEnabled", {
 		Text = "Enemy Chams",
 		Default = Config.HighlightEnabled,
