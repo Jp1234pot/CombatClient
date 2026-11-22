@@ -1,32 +1,38 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-local LocalizationService = game:GetService("LocalizationService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 
 local function getEnv()
-	return (typeof(getgenv) == "function" and getgenv()) or _G
+	if typeof(getgenv) == "function" then
+		local ok, g = pcall(getgenv)
+		if ok and type(g) == "table" then
+			return g
+		end
+	end
+	return _G
 end
 
 local env = getEnv()
 
-local BB_PLACE_IDS = {
+local BAD_BUSINESS_PLACE_IDS = {
 	[11379161761] = true,
 	[3233893879] = true,
 }
 
 local BB_SCRIPT_URL = "https://raw.githubusercontent.com/Jp1234pot/CombatClient/refs/heads/main/src/combat_client_bad_business.lua"
 
-if BB_PLACE_IDS[game.PlaceId] and not env._CombatClientLoadingBB then
-	env._CombatClientLoadingBB = true
+local function isBadBusinessPlace()
+	return BAD_BUSINESS_PLACE_IDS[game.PlaceId] == true
+end
 
+if isBadBusinessPlace() and not env._CombatClientLoadingBB then
+	env._CombatClientLoadingBB = true
 	local okFetch, src = pcall(function()
 		return game:HttpGet(BB_SCRIPT_URL)
 	end)
-
 	if okFetch and typeof(src) == "string" and #src > 0 then
 		local okCompile, chunk = pcall(loadstring, src)
 		if okCompile and typeof(chunk) == "function" then
@@ -35,41 +41,30 @@ if BB_PLACE_IDS[game.PlaceId] and not env._CombatClientLoadingBB then
 			if okRun then
 				return res
 			end
-			warn("[CombatClient] Failed running Bad Business script:", tostring(res))
+			warn("[CombatClient] BB script runtime error:", tostring(res))
 		else
 			env._CombatClientLoadingBB = false
-			warn("[CombatClient] Failed compiling Bad Business script:", tostring(chunk))
+			warn("[CombatClient] BB script compile error:", tostring(chunk))
 		end
 	else
 		env._CombatClientLoadingBB = false
-		warn("[CombatClient] Failed fetching Bad Business script:", tostring(src))
+		warn("[CombatClient] BB script fetch error:", tostring(src))
 	end
 end
 
 local function getExecutorFn(name)
-	local fn = rawget(env, name) or rawget(_G, name) or _G[name]
-	return typeof(fn) == "function" and fn or nil
-end
-
-local fnHookFunction = getExecutorFn("hookfunction")
-local fnNewCClosure = getExecutorFn("newcclosure")
-local fnCheckCaller = getExecutorFn("checkcaller")
-
-local function wrapCClosure(fn)
-	if not fnNewCClosure then
+	local fn = rawget(env, name) or rawget(_G, name)
+	if typeof(fn) == "function" then
 		return fn
 	end
-	local ok, wrapped = pcall(fnNewCClosure, fn)
-	return (ok and typeof(wrapped) == "function") and wrapped or fn
+	local ok, gFn = pcall(function()
+		return _G[name]
+	end)
+	return (ok and typeof(gFn) == "function") and gFn or nil
 end
 
-local function isOwnCaller()
-	if not fnCheckCaller then
-		return false
-	end
-	local ok, res = pcall(fnCheckCaller)
-	return ok and res == true
-end
+local fnNewCClosure = getExecutorFn("newcclosure")
+local fnSetFpsCap = getExecutorFn("setfpscap") or getExecutorFn("set_fps_cap")
 
 if env.CombatClient and typeof(env.CombatClient.Destroy) == "function" then
 	pcall(function()
@@ -79,29 +74,24 @@ end
 
 local CombatClient = {}
 
-local BAD_BUSINESS_PLACE_IDS = {
-	[11379161761] = true,
-	[3233893879] = true,
-}
-
-local function isBadBusinessPlace()
-	return BAD_BUSINESS_PLACE_IDS[game.PlaceId] == true
-end
-
 local SESSION_ID = HttpService:GenerateGUID(false)
 local SESSION_ATTR = "CombatClientSession"
-local HIGHLIGHT_NAME = "CombatClientHighlight"
+local ENEMY_HL_NAME = "CombatClientEnemyHL"
+local TEAM_HL_NAME = "CombatClientTeamHL"
 local RENDER_STEP_NAME = "CombatClient_SmartCameraStep"
 
 local DEFAULTS = {
-	Mode = "Camera", -- "Camera", "Raycast", or "Remote"
+	Mode = "Camera", -- "SilentAim", "Camera", or "Off"
 	PriorityMode = "Smart", -- "Smart", "Nearest", or "Crosshair"
 
 	HighlightEnabled = true,
+	TeammateHighlightEnabled = false,
 	MaxDistance = 500,
 	ThroughWalls = true,
 	FillColor = Color3.fromRGB(255, 65, 65),
 	OutlineColor = Color3.fromRGB(255, 45, 45),
+	TeammateFillColor = Color3.fromRGB(65, 145, 255),
+	TeammateOutlineColor = Color3.fromRGB(45, 120, 245),
 	FillTransparency = 0.85,
 	OutlineTransparency = 0,
 
@@ -114,36 +104,30 @@ local DEFAULTS = {
 	IgnoreSameTeam = true,
 	PreferHead = true,
 
-	CameraSmoothness = 0.35,
-	LockHoldSeconds = 0.2,
+	CameraSmoothness = 0.25,
+	LockHoldSeconds = 0.15,
 	CameraPriorityOffset = 1,
 
-	-- Game-specific feature flags (Bad Business)
-	BBChamsEnabled = true,
-	BBMaxDistance = 600,
-	BBThroughWalls = true,
+	FPSControlEnabled = false,
+	FPSCap = 120,
 
-	DebugLogs = true,
+	DebugLogs = false,
 }
 
 local Config = {}
 local Connections = {}
-local Highlights = {}
-local BBHighlights = {}
-local HookedOriginals = {}
+local Highlights = {} -- [model] = { Instance = Highlight, Role = "enemy" | "teammate" }
+local TraceTimers = {} -- [tag] = lastClock
 local Initialized = false
-local HookBusy = false
+local BoundPriority = nil
 local HighlightAccum = 0
-local BBAccum = 0
 
-local TS = nil
-pcall(function()
-	local tsModule = ReplicatedStorage:FindFirstChild("TS")
-	if tsModule and typeof(require) == "function" then
-		local loaded = require(tsModule)
-		TS = typeof(loaded) == "function" and loaded() or loaded
-	end
-end)
+local WallRayParams = RaycastParams.new()
+WallRayParams.FilterType = Enum.RaycastFilterType.Exclude
+WallRayParams.IgnoreWater = true
+local WallIgnoreCache = {}
+local CachedIgnoreChar = nil
+local CachedIgnoreCam = nil
 
 local LockState = {
 	Character = nil,
@@ -156,16 +140,47 @@ local function log(...)
 	end
 end
 
+local function traceThrottled(tag, interval, ...)
+	if not Config.DebugLogs then
+		return
+	end
+	local now = os.clock()
+	local prev = TraceTimers[tag] or 0
+	if (now - prev) >= (interval or 0.5) then
+		TraceTimers[tag] = now
+		print(string.format("[CombatClient:%s]", tostring(tag)), ...)
+	end
+end
+
 local function resetLockState()
 	LockState.Character = nil
 	LockState.LastValidAt = 0
+end
+
+local function applyFpsCap()
+	if not fnSetFpsCap then
+		return
+	end
+	local fps = Config.FPSControlEnabled and math.clamp(tonumber(Config.FPSCap) or 120, 15, 360) or 0
+	pcall(fnSetFpsCap, fps)
+end
+
+local function getLocalCharacter()
+	if typeof(CombatClient._AdapterGetLocalCharacter) == "function" then
+		local ok, char = pcall(CombatClient._AdapterGetLocalCharacter)
+		if ok and char then
+			return char
+		end
+	end
+	return LocalPlayer and LocalPlayer.Character or nil
 end
 
 local function getCharacterRoot(character)
 	if not character then
 		return nil
 	end
-	return character:FindFirstChild("HumanoidRootPart")
+	return character:FindFirstChild("Root")
+		or character:FindFirstChild("HumanoidRootPart")
 		or character.PrimaryPart
 		or character:FindFirstChild("Head")
 		or character:FindFirstChildWhichIsA("BasePart", true)
@@ -175,26 +190,37 @@ local function getAimPart(character)
 	if not character then
 		return nil
 	end
+	local body = character:FindFirstChild("Body")
+	local bodyHead = body and body:FindFirstChild("Head")
+	local bodyChest = body and body:FindFirstChild("Chest")
 	if Config.PreferHead then
-		return character:FindFirstChild("Head")
-			or character:FindFirstChild("HumanoidRootPart")
+		return bodyHead
+			or character:FindFirstChild("Head")
+			or bodyChest
 			or getCharacterRoot(character)
 	end
-	return character:FindFirstChild("HumanoidRootPart")
-		or character:FindFirstChild("Head")
+	return bodyChest
 		or getCharacterRoot(character)
+		or bodyHead
+		or character:FindFirstChild("Head")
 end
 
 local function isAliveCharacter(character)
+	if typeof(CombatClient._AdapterIsAlive) == "function" then
+		local ok, alive = pcall(CombatClient._AdapterIsAlive, character)
+		if ok then
+			return alive == true
+		end
+	end
 	if not character or not character:IsA("Model") or character.Parent == nil then
 		return false
 	end
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if not humanoid or humanoid.Health <= 0 then
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then
 		return false
 	end
 	local okState, state = pcall(function()
-		return humanoid:GetState()
+		return hum:GetState()
 	end)
 	if okState and state == Enum.HumanoidStateType.Dead then
 		return false
@@ -203,11 +229,16 @@ local function isAliveCharacter(character)
 end
 
 local function isLocalPlayerAlive()
-	local char = LocalPlayer and LocalPlayer.Character
-	return isAliveCharacter(char)
+	if typeof(CombatClient._AdapterIsLocalAlive) == "function" then
+		local ok, alive = pcall(CombatClient._AdapterIsLocalAlive)
+		if ok then
+			return alive == true
+		end
+	end
+	return isAliveCharacter(getLocalCharacter())
 end
 
-local function getPlayerFromCharacter(model)
+local function getPlayerFromModel(model)
 	if not model then
 		return nil
 	end
@@ -216,68 +247,86 @@ local function getPlayerFromCharacter(model)
 		return plr
 	end
 	for _, player in ipairs(Players:GetPlayers()) do
-		if player.Character == model then
+		if player.Character == model or player.Name == model.Name then
 			return player
 		end
 	end
 	return nil
 end
 
-local function isEnemyPlayer(player)
-	if not player or player == LocalPlayer or player.Parent ~= Players then
-		return false
+local function classifyModelRole(model, player)
+	if typeof(CombatClient._AdapterClassifyRole) == "function" then
+		local ok, role = pcall(CombatClient._AdapterClassifyRole, model, player)
+		if ok and (role == "enemy" or role == "teammate" or role == "none") then
+			return role
+		end
 	end
-	if Config.IgnoreSameTeam and LocalPlayer and LocalPlayer.Team and player.Team == LocalPlayer.Team then
-		return false
+	local myChar = getLocalCharacter()
+	if not model or model == myChar then
+		return "none"
 	end
-	return true
+	local plr = player or getPlayerFromModel(model)
+	if plr == LocalPlayer then
+		return "none"
+	end
+	if Config.IgnoreSameTeam and plr and LocalPlayer and LocalPlayer.Team and plr.Team then
+		return (plr.Team == LocalPlayer.Team) and "teammate" or "enemy"
+	end
+	local attrTeam = model:GetAttribute("Team") or model:GetAttribute("TeamName")
+	local myTeam = LocalPlayer and (LocalPlayer.Team or LocalPlayer:GetAttribute("Team") or LocalPlayer:GetAttribute("TeamName"))
+	if attrTeam ~= nil and myTeam ~= nil then
+		return (tostring(attrTeam) == tostring(myTeam)) and "teammate" or "enemy"
+	end
+	return "enemy"
 end
 
-local function isModelAllowedByFilters(model)
-	if not model or model == (LocalPlayer and LocalPlayer.Character) or not isAliveCharacter(model) then
-		return false
+local function getCandidateModels(includeTeammates)
+	if typeof(CombatClient._AdapterGetCandidates) == "function" then
+		local ok, list = pcall(CombatClient._AdapterGetCandidates, includeTeammates)
+		if ok and typeof(list) == "table" then
+			return list
+		end
 	end
-	local plr = getPlayerFromCharacter(model)
-	if plr then
-		return Config.TargetPlayers == true and isEnemyPlayer(plr)
-	end
-	return Config.TargetNPCs == true
-end
 
-local function getCandidateModels()
 	local entries = {}
-	local seenModels = {}
+	local seen = {}
+	local myChar = getLocalCharacter()
 
 	if Config.TargetPlayers then
 		for _, player in ipairs(Players:GetPlayers()) do
-			if not isEnemyPlayer(player) then
+			if player == LocalPlayer or player.Parent ~= Players then
 				continue
 			end
 			local char = player.Character
-			if not char or seenModels[char] or not isAliveCharacter(char) then
+			if not char or char == myChar or seen[char] or not isAliveCharacter(char) then
 				continue
 			end
-			seenModels[char] = true
+			local role = classifyModelRole(char, player)
+			if role ~= "enemy" and not (includeTeammates and role == "teammate") then
+				continue
+			end
+			seen[char] = true
 			table.insert(entries, {
 				Player = player,
 				Character = char,
 				Name = player.Name,
 				IsNPC = false,
+				Role = role,
 			})
 		end
 	end
 
 	if Config.TargetNPCs then
-		local localChar = LocalPlayer and LocalPlayer.Character
 		for _, child in ipairs(Workspace:GetChildren()) do
-			if child:IsA("Model") and child ~= localChar and not seenModels[child] then
-				if getPlayerFromCharacter(child) == nil and isAliveCharacter(child) then
-					seenModels[child] = true
+			if child:IsA("Model") and child ~= myChar and not seen[child] then
+				if getPlayerFromModel(child) == nil and isAliveCharacter(child) then
+					seen[child] = true
 					table.insert(entries, {
 						Player = nil,
 						Character = child,
 						Name = child.Name,
 						IsNPC = true,
+						Role = "enemy",
 					})
 				end
 			end
@@ -287,323 +336,168 @@ local function getCandidateModels()
 	return entries
 end
 
+local function syncWallIgnoreList()
+	local myChar = getLocalCharacter()
+	local cam = Workspace.CurrentCamera
+	if myChar == CachedIgnoreChar and cam == CachedIgnoreCam then
+		return
+	end
+	CachedIgnoreChar = myChar
+	CachedIgnoreCam = cam
+	table.clear(WallIgnoreCache)
+	if myChar then
+		table.insert(WallIgnoreCache, myChar)
+	end
+	if LocalPlayer and LocalPlayer.Character and LocalPlayer.Character ~= myChar then
+		table.insert(WallIgnoreCache, LocalPlayer.Character)
+	end
+	if cam then
+		table.insert(WallIgnoreCache, cam)
+	end
+	WallRayParams.FilterDescendantsInstances = WallIgnoreCache
+end
+
 local function isClearOfWalls(origin, targetPart, targetCharacter)
 	if not targetPart or not targetPart.Parent then
 		return false
 	end
-
-	local characterModel = targetCharacter or targetPart:FindFirstAncestorOfClass("Model") or targetPart.Parent
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-
-	local ignoreList = {}
-	if LocalPlayer and LocalPlayer.Character then
-		table.insert(ignoreList, LocalPlayer.Character)
-	end
-	if Workspace.CurrentCamera then
-		table.insert(ignoreList, Workspace.CurrentCamera)
-	end
-	params.FilterDescendantsInstances = ignoreList
-	params.IgnoreWater = true
-
-	local offset = targetPart.Position - origin
-	if offset.Magnitude < 0.001 then
+	syncWallIgnoreList()
+	local delta = targetPart.Position - origin
+	if delta.Magnitude < 0.001 then
 		return true
 	end
-
-	local result = Workspace:Raycast(origin, offset, params)
+	local result = Workspace:Raycast(origin, delta, WallRayParams)
 	if not result then
 		return true
 	end
-
-	return result.Instance:IsDescendantOf(characterModel)
+	local model = targetCharacter or targetPart:FindFirstAncestorOfClass("Model")
+	return model ~= nil and result.Instance:IsDescendantOf(model)
 end
 
-local function computePriorityScore(dist, angleDeg, maxDist, maxAngleDeg, isCurrentLock)
+local function computePriorityScore(dist, angleDeg, maxDist, maxAngleDeg, isLocked)
 	local normDist = math.clamp(dist / math.max(maxDist, 1), 0, 1)
 	local normAngle = math.clamp(angleDeg / math.max(maxAngleDeg, 1), 0, 1)
-	local stickBonus = isCurrentLock and -0.12 or 0
+	local stickBonus = isLocked and -0.12 or 0
 
 	if Config.PriorityMode == "Nearest" then
 		return normDist + (normAngle * 0.2) + stickBonus
 	elseif Config.PriorityMode == "Crosshair" then
 		return normAngle + (normDist * 0.2) + stickBonus
-	else
-		return (normAngle * 0.55) + (normDist * 0.45) + stickBonus
 	end
+	return (normAngle * 0.55) + (normDist * 0.45) + stickBonus
 end
 
-local function isOwnHighlight(inst)
+local function isOwnHighlight(inst, expectedName)
 	return typeof(inst) == "Instance"
 		and inst:IsA("Highlight")
-		and inst.Name == HIGHLIGHT_NAME
+		and inst.Name == expectedName
 		and inst:GetAttribute(SESSION_ATTR) == SESSION_ID
 end
 
-local function clearCharacterHighlight(character)
-	local entry = Highlights[character]
+local function clearModelHighlight(model)
+	local entry = Highlights[model]
 	if entry then
-		if entry.Instance and entry.Instance.Parent and isOwnHighlight(entry.Instance) then
-			entry.Instance:Destroy()
+		if entry.Instance and entry.Instance.Parent then
+			pcall(function()
+				entry.Instance:Destroy()
+			end)
 		end
-		Highlights[character] = nil
+		Highlights[model] = nil
 	end
-
-	if character and character.Parent then
-		for _, child in ipairs(character:GetChildren()) do
-			if isOwnHighlight(child) then
-				child:Destroy()
+	if model and model.Parent then
+		for _, child in ipairs(model:GetChildren()) do
+			if isOwnHighlight(child, ENEMY_HL_NAME) or isOwnHighlight(child, TEAM_HL_NAME) then
+				pcall(function()
+					child:Destroy()
+				end)
 			end
 		end
 	end
 end
 
 local function clearAllHighlights()
-	for char in pairs(Highlights) do
-		clearCharacterHighlight(char)
+	for model in pairs(Highlights) do
+		clearModelHighlight(model)
 	end
-	for _, obj in ipairs(Workspace:GetDescendants()) do
-		if isOwnHighlight(obj) then
-			obj:Destroy()
-		end
+end
+
+local function applyHighlightStyle(hl, role)
+	hl.DepthMode = Config.ThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
+	hl.FillTransparency = Config.FillTransparency
+	hl.OutlineTransparency = Config.OutlineTransparency
+	if role == "teammate" then
+		hl.FillColor = Config.TeammateFillColor
+		hl.OutlineColor = Config.TeammateOutlineColor
+	else
+		hl.FillColor = Config.FillColor
+		hl.OutlineColor = Config.OutlineColor
 	end
 end
 
 local function updateHighlights()
-	if not Initialized or not Config.HighlightEnabled or not isLocalPlayerAlive() then
+	local showEnemy = Initialized and Config.HighlightEnabled == true
+	local showTeam = Initialized and Config.TeammateHighlightEnabled == true
+	if not showEnemy and not showTeam then
 		clearAllHighlights()
 		return
 	end
 
-	local myRoot = getCharacterRoot(LocalPlayer and LocalPlayer.Character)
-	if not myRoot then
-		clearAllHighlights()
+	local cam = Workspace.CurrentCamera
+	local myRoot = getCharacterRoot(getLocalCharacter())
+	local originPos = myRoot and myRoot.Position or (cam and cam.CFrame.Position)
+	if not originPos then
 		return
 	end
 
-	local myPos = myRoot.Position
+	local candidates = getCandidateModels(showTeam)
 	local validSet = {}
-	local candidates = getCandidateModels()
 
 	for _, entry in ipairs(candidates) do
-		local character = entry.Character
-		local root = getCharacterRoot(character)
-		if not character or not root then
+		local model = entry.Character
+		local role = entry.Role or classifyModelRole(model, entry.Player)
+		if role == "enemy" and not showEnemy then
+			continue
+		elseif role == "teammate" and not showTeam then
+			continue
+		elseif role ~= "enemy" and role ~= "teammate" then
 			continue
 		end
 
-		if (root.Position - myPos).Magnitude > Config.MaxDistance then
-			continue
-		end
-
-		validSet[character] = true
-
-		local existing = Highlights[character]
-		if existing and not isOwnHighlight(existing.Instance) then
-			clearCharacterHighlight(character)
-			existing = nil
-		end
-
-		if not existing then
-			local hl = Instance.new("Highlight")
-			hl.Name = HIGHLIGHT_NAME
-			hl:SetAttribute(SESSION_ATTR, SESSION_ID)
-			hl.Adornee = character
-			hl.DepthMode = Config.ThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
-			hl.FillColor = Config.FillColor
-			hl.OutlineColor = Config.OutlineColor
-			hl.FillTransparency = Config.FillTransparency
-			hl.OutlineTransparency = Config.OutlineTransparency
-			hl.Parent = character
-
-			Highlights[character] = {
-				Instance = hl,
-				Character = character,
-			}
-		end
-	end
-
-	for char in pairs(Highlights) do
-		if not validSet[char] then
-			clearCharacterHighlight(char)
-		end
-	end
-end
-
--- ===================== BAD BUSINESS FEATURED CHAMS =====================
-local function clearBBModelHighlight(model)
-	local hl = BBHighlights[model]
-	if hl then
-		if hl.Parent and isOwnHighlight(hl) then
-			hl:Destroy()
-		end
-		BBHighlights[model] = nil
-	end
-	if model and model.Parent then
-		for _, child in ipairs(model:GetChildren()) do
-			if isOwnHighlight(child) then
-				child:Destroy()
-			end
-		end
-	end
-end
-
-local function clearAllBBHighlights()
-	for model in pairs(BBHighlights) do
-		clearBBModelHighlight(model)
-	end
-end
-
-local function isBBModelAlive(model)
-	if not model or not model:IsA("Model") or model.Parent == nil then
-		return false
-	end
-	local hum = model:FindFirstChildOfClass("Humanoid")
-	if hum and hum.Health <= 0 then
-		return false
-	end
-	local healthAttr = model:GetAttribute("Health")
-	if typeof(healthAttr) == "number" and healthAttr <= 0 then
-		return false
-	end
-	return true
-end
-
-local function getBBLocalTeam()
-	if LocalPlayer and LocalPlayer.Team then
-		return LocalPlayer.Team
-	end
-	local attrTeam = LocalPlayer and (LocalPlayer:GetAttribute("Team") or LocalPlayer:GetAttribute("TeamName"))
-	if attrTeam ~= nil then
-		return attrTeam
-	end
-	local myChar = LocalPlayer and LocalPlayer.Character
-	if myChar then
-		return myChar:GetAttribute("Team") or myChar:GetAttribute("TeamName")
-	end
-	return nil
-end
-
-local function isBBEnemyModel(model)
-	if not model or not model:IsA("Model") then
-		return false
-	end
-	local myChar = LocalPlayer and LocalPlayer.Character
-	if model == myChar then
-		return false
-	end
-	local plr = Players:GetPlayerFromCharacter(model)
-	if plr == LocalPlayer then
-		return false
-	end
-	if TS and typeof(TS.Teams) == "table" and typeof(TS.Teams.IsEnemy) == "function" then
-		local ok, enemy = pcall(TS.Teams.IsEnemy, TS.Teams, model)
-		if ok and typeof(enemy) == "boolean" then
-			return enemy
-		end
-	end
-	local modelTeam = model:GetAttribute("Team") or model:GetAttribute("TeamName")
-	local myTeam = getBBLocalTeam()
-	if modelTeam ~= nil and myTeam ~= nil then
-		return tostring(modelTeam) ~= tostring(myTeam)
-	end
-	if plr and LocalPlayer and LocalPlayer.Team and plr.Team then
-		return plr.Team ~= LocalPlayer.Team
-	end
-	return true
-end
-
-local function collectBBEnemyModels()
-	local found = {}
-	local seen = {}
-
-	if TS and typeof(TS.Characters) == "table" and typeof(TS.Characters.GetCharacters) == "function" then
-		local ok, chars = pcall(TS.Characters.GetCharacters, TS.Characters)
-		if ok and typeof(chars) == "table" then
-			for _, item in pairs(chars) do
-				local model = typeof(item) == "Instance" and item or (typeof(item) == "table" and (item.Character or item.Model))
-				if typeof(model) == "Instance" and model:IsA("Model") and not seen[model] then
-					seen[model] = true
-					if isBBModelAlive(model) and isBBEnemyModel(model) then
-						table.insert(found, model)
-					end
-				end
-			end
-			if #found > 0 then
-				return found
-			end
-		end
-	end
-
-	for _, obj in ipairs(Workspace:GetDescendants()) do
-		if obj:IsA("Model") and not seen[obj] then
-			if obj:FindFirstChild("Root") or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildOfClass("Humanoid") then
-				seen[obj] = true
-				if isBBModelAlive(obj) and isBBEnemyModel(obj) then
-					table.insert(found, obj)
-				end
-			end
-		end
-	end
-
-	return found
-end
-
-local function updateBadBusinessChams()
-	if not Initialized or not isBadBusinessPlace() or not Config.BBChamsEnabled then
-		clearAllBBHighlights()
-		return
-	end
-
-	local myChar = LocalPlayer and LocalPlayer.Character
-	local myAnchor = getCharacterRoot(myChar)
-	local myPos = myAnchor and myAnchor.Position or (Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position)
-	if not myPos then
-		return
-	end
-
-	local enemies = collectBBEnemyModels()
-	local validSet = {}
-
-	for _, model in ipairs(enemies) do
-		local anchor = getCharacterRoot(model)
-		if not anchor then
-			continue
-		end
-		if (anchor.Position - myPos).Magnitude > Config.BBMaxDistance then
+		local root = getCharacterRoot(model)
+		if not root or (root.Position - originPos).Magnitude > Config.MaxDistance then
 			continue
 		end
 
 		validSet[model] = true
+		local desiredName = (role == "teammate") and TEAM_HL_NAME or ENEMY_HL_NAME
+		local entryHL = Highlights[model]
+		local hl = entryHL and entryHL.Instance
 
-		local hl = BBHighlights[model]
-		if not hl or not hl.Parent or not isOwnHighlight(hl) then
-			clearBBModelHighlight(model)
+		if not hl or not hl.Parent or not isOwnHighlight(hl, desiredName) then
+			clearModelHighlight(model)
 			hl = Instance.new("Highlight")
-			hl.Name = HIGHLIGHT_NAME
+			hl.Name = desiredName
 			hl:SetAttribute(SESSION_ATTR, SESSION_ID)
 			hl.Adornee = model
 			hl.Parent = model
-			BBHighlights[model] = hl
+			Highlights[model] = {
+				Instance = hl,
+				Role = role,
+			}
 		end
 
-		hl.DepthMode = Config.BBThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
-		hl.FillColor = Config.FillColor
-		hl.OutlineColor = Color3.fromRGB(255, 45, 45)
-		hl.FillTransparency = Config.FillTransparency
-		hl.OutlineTransparency = Config.OutlineTransparency
+		applyHighlightStyle(hl, role)
 	end
 
-	for model in pairs(BBHighlights) do
+	for model in pairs(Highlights) do
 		if not validSet[model] then
-			clearBBModelHighlight(model)
+			clearModelHighlight(model)
 		end
 	end
 end
--- =====================================================================
 
 function CombatClient.GetAssistTarget(origin, direction)
-	if not Initialized or not Config.AssistEnabled or not isLocalPlayerAlive() then
+	if not Initialized or not Config.AssistEnabled or Config.Mode == "Off" or not isLocalPlayerAlive() then
 		resetLockState()
 		return nil
 	end
@@ -615,20 +509,22 @@ function CombatClient.GetAssistTarget(origin, direction)
 	local maxAngleRad = math.rad(Config.AssistMaxAngleDegrees)
 	local maxDist = Config.AssistMaxDistance
 	local maxDistSq = maxDist * maxDist
-	local candidates = getCandidateModels()
+	local candidates = getCandidateModels(false)
 	local checkWalls = Config.WallCheck == true
 	local now = os.clock()
 
 	local bestTarget = nil
 	local bestScore = math.huge
-	local lockedEntryTarget = nil
+	local lockedTarget = nil
 
 	for _, entry in ipairs(candidates) do
 		local character = entry.Character
+		if entry.Role and entry.Role ~= "enemy" then
+			continue
+		end
 		if not isAliveCharacter(character) then
 			continue
 		end
-
 		local aimPart = getAimPart(character)
 		if not aimPart then
 			continue
@@ -667,9 +563,8 @@ function CombatClient.GetAssistTarget(origin, direction)
 		}
 
 		if isLocked then
-			lockedEntryTarget = built
+			lockedTarget = built
 		end
-
 		if score < bestScore then
 			bestScore = score
 			bestTarget = built
@@ -679,24 +574,22 @@ function CombatClient.GetAssistTarget(origin, direction)
 	if bestTarget then
 		LockState.Character = bestTarget.Character
 		LockState.LastValidAt = now
+		traceThrottled("Target", 0.5, "Selected:", bestTarget.Name, string.format("%.1f studs", bestTarget.Distance))
 		return bestTarget
 	end
 
-	if lockedEntryTarget then
+	if lockedTarget then
 		LockState.LastValidAt = now
-		return lockedEntryTarget
+		return lockedTarget
 	end
 
-	if LockState.Character
-		and isModelAllowedByFilters(LockState.Character)
-		and (now - LockState.LastValidAt) <= Config.LockHoldSeconds
-	then
+	if LockState.Character and isAliveCharacter(LockState.Character) and (now - LockState.LastValidAt) <= Config.LockHoldSeconds then
 		local aimPart = getAimPart(LockState.Character)
 		if aimPart and (not checkWalls or isClearOfWalls(origin, aimPart, LockState.Character)) then
 			local offset = aimPart.Position - origin
 			local dist = offset.Magnitude
 			if dist >= 0.001 and dist <= maxDist then
-				local plr = getPlayerFromCharacter(LockState.Character)
+				local plr = getPlayerFromModel(LockState.Character)
 				return {
 					Player = plr,
 					Character = LockState.Character,
@@ -717,33 +610,32 @@ function CombatClient.GetAssistTarget(origin, direction)
 end
 
 function CombatClient.GetAdjustedDirection(origin, direction)
-	if not Initialized or not Config.AssistEnabled or not isLocalPlayerAlive() then
+	if not Initialized or not Config.AssistEnabled or Config.Mode == "Off" or not isLocalPlayerAlive() then
 		return direction
 	end
 	if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then
 		return direction
 	end
-
-	local candidate = CombatClient.GetAssistTarget(origin, direction)
-	if not candidate or not candidate.Position then
+	local cand = CombatClient.GetAssistTarget(origin, direction)
+	if not cand or not cand.Position then
 		return direction
 	end
-
-	local delta = candidate.Position - origin
+	local delta = cand.Position - origin
 	if delta.Magnitude < 0.001 then
 		return direction
 	end
-
 	return delta.Unit * direction.Magnitude
 end
 
-local function stepSmartCamera(dt)
-	if not Initialized or not Config.AssistEnabled or Config.Mode ~= "Camera" then
-		resetLockState()
-		return
-	end
+function CombatClient.IsSilentAimActive()
+	return Initialized
+		and Config.AssistEnabled == true
+		and Config.Mode == "SilentAim"
+		and isLocalPlayerAlive()
+end
 
-	if not isLocalPlayerAlive() then
+local function stepSmartCamera(dt)
+	if not Initialized or not Config.AssistEnabled or Config.Mode ~= "Camera" or not isLocalPlayerAlive() then
 		resetLockState()
 		return
 	end
@@ -754,119 +646,57 @@ local function stepSmartCamera(dt)
 	end
 
 	local origin = cam.CFrame.Position
-	local look = cam.CFrame.LookVector
-	local candidate = CombatClient.GetAssistTarget(origin, look)
-	if not candidate or not candidate.Position then
+	local cand = CombatClient.GetAssistTarget(origin, cam.CFrame.LookVector)
+	if not cand or not cand.Position then
 		return
 	end
 
-	local targetCFrame = CFrame.lookAt(origin, candidate.Position)
-	local alpha = math.clamp(1 - ((1 - Config.CameraSmoothness) ^ (dt * 60)), 0, 1)
-	cam.CFrame = cam.CFrame:Lerp(targetCFrame, alpha)
+	local maxSmooth = isBadBusinessPlace() and 0.14 or 0.45
+	local smooth = math.min(Config.CameraSmoothness, maxSmooth)
+	local alpha = math.clamp(1 - ((1 - smooth) ^ (dt * 60)), 0, maxSmooth)
+
+	local currentCf = cam.CFrame
+	local targetCf = CFrame.lookAt(currentCf.Position, cand.Position)
+	local rx, ry, rz = currentCf:ToObjectSpace(targetCf):ToEulerAnglesYXZ()
+	cam.CFrame = currentCf * CFrame.fromEulerAnglesYXZ(rx * alpha, ry * alpha, rz * alpha)
 end
 
-local function installHooksOnce()
-	if next(HookedOriginals) ~= nil then
+local function bindCameraStep()
+	local targetPriority = Enum.RenderPriority.Camera.Value + (tonumber(Config.CameraPriorityOffset) or 1)
+	if BoundPriority == targetPriority then
 		return
 	end
-	if not fnHookFunction then
-		log("hookfunction not available; Camera mode still works.")
-		return
-	end
-
-	local installed = {}
-
-	if typeof(Workspace.Raycast) == "function" then
-		local oldRaycast
-		local ok = pcall(function()
-			oldRaycast = fnHookFunction(Workspace.Raycast, wrapCClosure(function(ws, origin, direction, params)
-				if HookBusy or isOwnCaller() or not Initialized or not Config.AssistEnabled or Config.Mode ~= "Raycast" or not isLocalPlayerAlive() then
-					return oldRaycast(ws, origin, direction, params)
-				end
-				HookBusy = true
-				local okAdj, adj = pcall(CombatClient.GetAdjustedDirection, origin, direction)
-				HookBusy = false
-				local finalDir = (okAdj and typeof(adj) == "Vector3") and adj or direction
-				return oldRaycast(ws, origin, finalDir, params)
-			end))
-		end)
-		if ok and typeof(oldRaycast) == "function" then
-			HookedOriginals.Raycast = oldRaycast
-			table.insert(installed, "Workspace.Raycast")
-		end
-	end
-
-	local remote = LocalizationService:FindFirstChild("RemoteEvent")
-	if remote and remote:IsA("RemoteEvent") and typeof(remote.FireServer) == "function" then
-		local oldFire
-		local ok = pcall(function()
-			oldFire = fnHookFunction(remote.FireServer, wrapCClosure(function(rem, ...)
-				if HookBusy or isOwnCaller() or rem ~= remote or not Initialized or not Config.AssistEnabled or Config.Mode ~= "Remote" or not isLocalPlayerAlive() then
-					return oldFire(rem, ...)
-				end
-
-				local args = { ... }
-				local action = args[2]
-
-				if action == "Fire" and typeof(args[5]) == "CFrame" then
-					local cf = args[5]
-					HookBusy = true
-					local okCand, cand = pcall(CombatClient.GetAssistTarget, cf.Position, cf.LookVector)
-					HookBusy = false
-
-					if okCand and cand and cand.Position and (cand.Position - cf.Position).Magnitude > 0.001 then
-						args[5] = CFrame.lookAt(cf.Position, cand.Position)
-						return oldFire(rem, table.unpack(args))
-					end
-				elseif action == "Hitcheck" then
-					local cam = Workspace.CurrentCamera
-					if cam then
-						HookBusy = true
-						local okCand, cand = pcall(CombatClient.GetAssistTarget, cam.CFrame.Position, cam.CFrame.LookVector)
-						HookBusy = false
-
-						if okCand and cand and cand.Character then
-							local aimPart = getAimPart(cand.Character)
-							if aimPart then
-								args[4] = cand.Player and cand.Player.Name or cand.Character.Name
-								args[5] = aimPart.Name
-								if typeof(args[6]) == "table" then
-									local hitData = table.clone(args[6])
-									if typeof(hitData[4]) == "Vector3" then
-										hitData[4] = aimPart.Position
-									end
-									args[6] = hitData
-								end
-								return oldFire(rem, table.unpack(args))
-							end
-						end
-					end
-				end
-
-				return oldFire(rem, ...)
-			end))
-		end)
-		if ok and typeof(oldFire) == "function" then
-			HookedOriginals.FireServer = oldFire
-			table.insert(installed, "RemoteEvent.FireServer")
-		end
-	end
-
-	log("Hooks ready:", #installed > 0 and table.concat(installed, ", ") or "none")
+	pcall(function()
+		RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+	end)
+	RunService:BindToRenderStep(RENDER_STEP_NAME, targetPriority, stepSmartCamera)
+	BoundPriority = targetPriority
 end
 
 function CombatClient.SetConfig(partial)
 	if typeof(partial) ~= "table" then
 		return
 	end
-	for key, val in pairs(partial) do
-		if Config[key] ~= nil then
-			Config[key] = val
+	local fpsDirty = false
+	local priorityDirty = false
+	for k, v in pairs(partial) do
+		if Config[k] ~= nil then
+			Config[k] = v
+			if k == "FPSControlEnabled" or k == "FPSCap" then
+				fpsDirty = true
+			elseif k == "CameraPriorityOffset" then
+				priorityDirty = true
+			end
 		end
 	end
+	if fpsDirty then
+		applyFpsCap()
+	end
 	if Initialized then
+		if priorityDirty then
+			bindCameraStep()
+		end
 		updateHighlights()
-		updateBadBusinessChams()
 	end
 end
 
@@ -876,16 +706,26 @@ end
 
 function CombatClient.Destroy()
 	Initialized = false
+	BoundPriority = nil
+	CachedIgnoreChar = nil
+	CachedIgnoreCam = nil
 	resetLockState()
+	if typeof(CombatClient._AdapterDestroy) == "function" then
+		pcall(CombatClient._AdapterDestroy)
+	end
+	if fnSetFpsCap then
+		pcall(fnSetFpsCap, 0)
+	end
 	pcall(function()
 		RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
 	end)
 	for _, conn in ipairs(Connections) do
-		conn:Disconnect()
+		pcall(function()
+			conn:Disconnect()
+		end)
 	end
 	table.clear(Connections)
 	clearAllHighlights()
-	clearAllBBHighlights()
 	log("Destroyed.")
 end
 
@@ -894,29 +734,26 @@ function CombatClient.Init(userConfig)
 		warn("[CombatClient] Client only.")
 		return
 	end
-
 	CombatClient.Destroy()
 
 	Config = table.clone(DEFAULTS)
 	if typeof(userConfig) == "table" then
-		for key, val in pairs(userConfig) do
-			if Config[key] ~= nil then
-				Config[key] = val
+		for k, v in pairs(userConfig) do
+			if Config[k] ~= nil then
+				Config[k] = v
 			end
 		end
 	end
 
 	Initialized = true
-	installHooksOnce()
+	applyFpsCap()
+	bindCameraStep()
 
 	if LocalPlayer then
 		table.insert(Connections, LocalPlayer.CharacterAdded:Connect(function()
 			resetLockState()
 			if Initialized then
-				task.defer(function()
-					updateHighlights()
-					updateBadBusinessChams()
-				end)
+				task.defer(updateHighlights)
 			end
 		end))
 	end
@@ -926,8 +763,7 @@ function CombatClient.Init(userConfig)
 			resetLockState()
 		end
 		if player.Character then
-			clearCharacterHighlight(player.Character)
-			clearBBModelHighlight(player.Character)
+			clearModelHighlight(player.Character)
 		end
 	end))
 
@@ -940,25 +776,14 @@ function CombatClient.Init(userConfig)
 			HighlightAccum = 0
 			updateHighlights()
 		end
-
-		if isBadBusinessPlace() then
-			BBAccum += dt
-			if BBAccum >= 0.25 then
-				BBAccum = 0
-				updateBadBusinessChams()
-			end
-		end
 	end))
 
-	RunService:BindToRenderStep(
-		RENDER_STEP_NAME,
-		Enum.RenderPriority.Camera.Value + Config.CameraPriorityOffset,
-		stepSmartCamera
-	)
+	if typeof(CombatClient._AdapterInit) == "function" then
+		pcall(CombatClient._AdapterInit, CombatClient)
+	end
 
 	updateHighlights()
-	updateBadBusinessChams()
-	log("Initialized | PlaceId:", game.PlaceId, "| BadBusiness:", isBadBusinessPlace(), "| Mode:", Config.Mode, "| Priority:", Config.PriorityMode)
+	log("Initialized | PlaceId:", game.PlaceId)
 	return CombatClient
 end
 
@@ -969,243 +794,216 @@ env.PremiumCombat = CombatClient
 _G.CombatClient = CombatClient
 _G.PremiumCombat = CombatClient
 
--- ===================== OBSIDIAN UI =====================
-local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-local okLib, Library = pcall(function()
-	return loadstring(game:HttpGet(repo .. "Library.lua"))()
-end)
+-- ===================== OBSIDIAN UI (UNIFIED) =====================
+task.spawn(function()
+	local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+	local okFetch, rawSrc = pcall(function()
+		return game:HttpGet(repo .. "Library.lua")
+	end)
+	if not okFetch or typeof(rawSrc) ~= "string" or #rawSrc == 0 then
+		return
+	end
+	local okChunk, chunk = pcall(loadstring, rawSrc)
+	if not okChunk or typeof(chunk) ~= "function" then
+		return
+	end
+	local okLib, Library = pcall(chunk)
+	if not okLib or not Library then
+		return
+	end
 
-if not okLib or not Library then
-	warn("[CombatClient] Failed to load Obsidian Library.")
-	return CombatClient
-end
-
-local Toggles = Library.Toggles
-local Options = Library.Options
-
-local Window = Library:CreateWindow({
-	Title = "CombatClient",
-	Footer = isBadBusinessPlace() and "Featured: Bad Business | Obsidian UI" or "Smart Camera | Obsidian UI",
-	ToggleKeybind = Enum.KeyCode.RightShift,
-	NotifySide = "Right",
-	ShowCustomCursor = false,
-})
-
-local CombatTab = Window:AddTab({
-	Name = "Combat",
-	Description = "Smart Camera & Aim",
-	Icon = "crosshair",
-})
-
-local VisualsTab = Window:AddTab({
-	Name = "Visuals",
-	Description = "Highlights & Cleanup",
-	Icon = "eye",
-})
-
-local AssistBox = CombatTab:AddLeftGroupbox("Smart Camera", "target")
-local FilterBox = CombatTab:AddRightGroupbox("Target Filters", "sliders")
-local EspBox = VisualsTab:AddLeftGroupbox("ESP Highlights", "scan-eye")
-local SystemBox = VisualsTab:AddRightGroupbox("Session", "wrench")
-
-AssistBox:AddToggle("AssistEnabled", {
-	Text = "Enable Smart Camera",
-	Default = Config.AssistEnabled,
-	Callback = function(val)
-		CombatClient.SetConfig({ AssistEnabled = val })
-		if not val then
-			resetLockState()
-		end
-	end,
-})
-
-AssistBox:AddDropdown("AssistMode", {
-	Text = "Assist Mode",
-	Values = { "Camera", "Raycast", "Remote" },
-	Default = Config.Mode,
-	Multi = false,
-	Callback = function(val)
-		CombatClient.SetConfig({ Mode = val })
-	end,
-})
-
-AssistBox:AddDropdown("PriorityMode", {
-	Text = "Target Priority",
-	Values = { "Smart", "Nearest", "Crosshair" },
-	Default = Config.PriorityMode,
-	Multi = false,
-	Callback = function(val)
-		CombatClient.SetConfig({ PriorityMode = val })
-	end,
-})
-
-AssistBox:AddSlider("CameraSmoothness", {
-	Text = "Camera Smoothness",
-	Default = Config.CameraSmoothness,
-	Min = 0.05,
-	Max = 1,
-	Rounding = 2,
-	Callback = function(val)
-		CombatClient.SetConfig({ CameraSmoothness = val })
-	end,
-})
-
-AssistBox:AddSlider("LockHoldSeconds", {
-	Text = "Lock Hold (sec)",
-	Default = Config.LockHoldSeconds,
-	Min = 0,
-	Max = 1,
-	Rounding = 2,
-	Callback = function(val)
-		CombatClient.SetConfig({ LockHoldSeconds = val })
-	end,
-})
-
-FilterBox:AddToggle("TargetPlayers", {
-	Text = "Target Players",
-	Default = Config.TargetPlayers,
-	Callback = function(val)
-		CombatClient.SetConfig({ TargetPlayers = val })
-	end,
-})
-
-FilterBox:AddToggle("TargetNPCs", {
-	Text = "Target NPCs",
-	Default = Config.TargetNPCs,
-	Callback = function(val)
-		CombatClient.SetConfig({ TargetNPCs = val })
-	end,
-})
-
-FilterBox:AddToggle("PreferHead", {
-	Text = "Prefer Head",
-	Default = Config.PreferHead,
-	Callback = function(val)
-		CombatClient.SetConfig({ PreferHead = val })
-	end,
-})
-
-FilterBox:AddToggle("WallCheck", {
-	Text = "Wall Check",
-	Default = Config.WallCheck,
-	Callback = function(val)
-		CombatClient.SetConfig({ WallCheck = val })
-	end,
-})
-
-FilterBox:AddToggle("IgnoreTeam", {
-	Text = "Ignore Same Team",
-	Default = Config.IgnoreSameTeam,
-	Callback = function(val)
-		CombatClient.SetConfig({ IgnoreSameTeam = val })
-	end,
-})
-
-FilterBox:AddSlider("MaxAngle", {
-	Text = "Max Angle (Deg)",
-	Default = Config.AssistMaxAngleDegrees,
-	Min = 1,
-	Max = 90,
-	Rounding = 0,
-	Callback = function(val)
-		CombatClient.SetConfig({ AssistMaxAngleDegrees = val })
-	end,
-})
-
-FilterBox:AddSlider("MaxAssistDist", {
-	Text = "Max Assist Distance",
-	Default = Config.AssistMaxDistance,
-	Min = 25,
-	Max = 1000,
-	Rounding = 0,
-	Callback = function(val)
-		CombatClient.SetConfig({ AssistMaxDistance = val })
-	end,
-})
-
-EspBox:AddToggle("HighlightEnabled", {
-	Text = "Enemy Highlights",
-	Default = Config.HighlightEnabled,
-	Callback = function(val)
-		CombatClient.SetConfig({ HighlightEnabled = val })
-	end,
-})
-
-EspBox:AddToggle("ThroughWalls", {
-	Text = "Always On Top",
-	Default = Config.ThroughWalls,
-	Callback = function(val)
-		CombatClient.SetConfig({ ThroughWalls = val })
-		clearAllHighlights()
-		updateHighlights()
-	end,
-})
-
-EspBox:AddSlider("EspMaxDist", {
-	Text = "ESP Max Distance",
-	Default = Config.MaxDistance,
-	Min = 50,
-	Max = 1500,
-	Rounding = 0,
-	Callback = function(val)
-		CombatClient.SetConfig({ MaxDistance = val })
-	end,
-})
-
--- Separated Featured Game Section for Bad Business (PlaceIds: 11379161761, 3233893879)
-if isBadBusinessPlace() then
-	local FeaturedTab = Window:AddTab({
-		Name = "Featured",
-		Description = "Bad Business Game Features",
-		Icon = "flame",
+	local Window = Library:CreateWindow({
+		Title = "CombatClient",
+		Footer = isBadBusinessPlace() and "Bad Business | Obsidian UI" or "Universal | Obsidian UI",
+		ToggleKeybind = Enum.KeyCode.RightShift,
+		NotifySide = "Right",
+		ShowCustomCursor = false,
 	})
 
-	local BBBox = FeaturedTab:AddLeftGroupbox("Bad Business", "shield-alert")
+	local CombatTab = Window:AddTab({
+		Name = "Combat",
+		Description = "Silent Aim & Camera",
+		Icon = "crosshair",
+	})
+	local VisualsTab = Window:AddTab({
+		Name = "Visuals",
+		Description = "Highlights & Session",
+		Icon = "eye",
+	})
 
-	BBBox:AddLabel("Featured Game Detected: Bad Business", true)
+	local AimBox = CombatTab:AddLeftGroupbox("Aim & Silent Aim", "target")
+	local FilterBox = CombatTab:AddRightGroupbox("Target Filters", "sliders")
+	local EspBox = VisualsTab:AddLeftGroupbox("Chams / Highlights", "scan-eye")
+	local SysBox = VisualsTab:AddRightGroupbox("Session & FPS", "wrench")
 
-	BBBox:AddToggle("BBChamsEnabled", {
-		Text = "Bad Business Chams",
-		Default = Config.BBChamsEnabled,
-		Callback = function(val)
-			CombatClient.SetConfig({ BBChamsEnabled = val })
+	AimBox:AddToggle("AssistEnabled", {
+		Text = "Enable Assist",
+		Default = Config.AssistEnabled,
+		Callback = function(v)
+			CombatClient.SetConfig({ AssistEnabled = v })
+			if not v then
+				resetLockState()
+			end
+		end,
+	})
+	AimBox:AddDropdown("AssistMode", {
+		Text = "Aim Mode",
+		Values = { "SilentAim", "Camera", "Off" },
+		Default = Config.Mode,
+		Multi = false,
+		Callback = function(v)
+			CombatClient.SetConfig({ Mode = v })
+		end,
+	})
+	AimBox:AddDropdown("PriorityMode", {
+		Text = "Target Priority",
+		Values = { "Smart", "Nearest", "Crosshair" },
+		Default = Config.PriorityMode,
+		Multi = false,
+		Callback = function(v)
+			CombatClient.SetConfig({ PriorityMode = v })
+		end,
+	})
+	AimBox:AddSlider("CameraSmoothness", {
+		Text = "Camera Smoothness",
+		Default = Config.CameraSmoothness,
+		Min = 0.02,
+		Max = 1,
+		Rounding = 2,
+		Callback = function(v)
+			CombatClient.SetConfig({ CameraSmoothness = v })
+		end,
+	})
+	AimBox:AddSlider("LockHoldSeconds", {
+		Text = "Lock Hold (sec)",
+		Default = Config.LockHoldSeconds,
+		Min = 0,
+		Max = 1,
+		Rounding = 2,
+		Callback = function(v)
+			CombatClient.SetConfig({ LockHoldSeconds = v })
 		end,
 	})
 
-	BBBox:AddToggle("BBThroughWalls", {
-		Text = "Chams Through Walls",
-		Default = Config.BBThroughWalls,
-		Callback = function(val)
-			CombatClient.SetConfig({ BBThroughWalls = val })
-			clearAllBBHighlights()
-			updateBadBusinessChams()
+	FilterBox:AddToggle("TargetPlayers", {
+		Text = "Target Players",
+		Default = Config.TargetPlayers,
+		Callback = function(v)
+			CombatClient.SetConfig({ TargetPlayers = v })
+		end,
+	})
+	FilterBox:AddToggle("TargetNPCs", {
+		Text = "Target NPCs",
+		Default = Config.TargetNPCs,
+		Callback = function(v)
+			CombatClient.SetConfig({ TargetNPCs = v })
+		end,
+	})
+	FilterBox:AddToggle("PreferHead", {
+		Text = "Prefer Head",
+		Default = Config.PreferHead,
+		Callback = function(v)
+			CombatClient.SetConfig({ PreferHead = v })
+		end,
+	})
+	FilterBox:AddToggle("WallCheck", {
+		Text = "Wall Check",
+		Default = Config.WallCheck,
+		Callback = function(v)
+			CombatClient.SetConfig({ WallCheck = v })
+		end,
+	})
+	FilterBox:AddToggle("IgnoreTeam", {
+		Text = "Ignore Same Team",
+		Default = Config.IgnoreSameTeam,
+		Callback = function(v)
+			CombatClient.SetConfig({ IgnoreSameTeam = v })
+		end,
+	})
+	FilterBox:AddSlider("MaxAngle", {
+		Text = "Max Angle / FOV (Deg)",
+		Default = Config.AssistMaxAngleDegrees,
+		Min = 1,
+		Max = 90,
+		Rounding = 0,
+		Callback = function(v)
+			CombatClient.SetConfig({ AssistMaxAngleDegrees = v })
+		end,
+	})
+	FilterBox:AddSlider("MaxAssistDist", {
+		Text = "Max Assist Distance",
+		Default = Config.AssistMaxDistance,
+		Min = 25,
+		Max = 1000,
+		Rounding = 0,
+		Callback = function(v)
+			CombatClient.SetConfig({ AssistMaxDistance = v })
 		end,
 	})
 
-	BBBox:AddSlider("BBMaxDist", {
+	-- Unified Chams / Highlights (works for both general & Bad Business roles)
+	EspBox:AddToggle("HighlightEnabled", {
+		Text = "Enemy Chams",
+		Default = Config.HighlightEnabled,
+		Callback = function(v)
+			CombatClient.SetConfig({ HighlightEnabled = v })
+		end,
+	})
+	EspBox:AddToggle("TeammateHighlightEnabled", {
+		Text = "Teammate Chams",
+		Default = Config.TeammateHighlightEnabled,
+		Callback = function(v)
+			CombatClient.SetConfig({ TeammateHighlightEnabled = v })
+		end,
+	})
+	EspBox:AddToggle("ThroughWalls", {
+		Text = "Always On Top",
+		Default = Config.ThroughWalls,
+		Callback = function(v)
+			CombatClient.SetConfig({ ThroughWalls = v })
+		end,
+	})
+	EspBox:AddSlider("EspMaxDist", {
 		Text = "Chams Max Distance",
-		Default = Config.BBMaxDistance,
+		Default = Config.MaxDistance,
 		Min = 50,
 		Max = 1500,
 		Rounding = 0,
-		Callback = function(val)
-			CombatClient.SetConfig({ BBMaxDistance = val })
+		Callback = function(v)
+			CombatClient.SetConfig({ MaxDistance = v })
 		end,
 	})
-end
 
-SystemBox:AddButton({
-	Text = "Unload & Cleanup",
-	Func = function()
-		CombatClient.Destroy()
-		pcall(function()
-			Library:Unload()
-		end)
-	end,
-})
+	SysBox:AddToggle("FPSControlEnabled", {
+		Text = "Custom FPS Cap",
+		Default = Config.FPSControlEnabled,
+		Callback = function(v)
+			CombatClient.SetConfig({ FPSControlEnabled = v })
+		end,
+	})
+	SysBox:AddSlider("FPSCapSlider", {
+		Text = "Target FPS",
+		Default = Config.FPSCap,
+		Min = 30,
+		Max = 240,
+		Rounding = 0,
+		Callback = function(v)
+			CombatClient.SetConfig({ FPSCap = v })
+		end,
+	})
+	SysBox:AddButton({
+		Text = "Unload & Cleanup",
+		Func = function()
+			CombatClient.Destroy()
+			pcall(function()
+				Library:Unload()
+			end)
+		end,
+	})
 
-env.ObsidianLibrary = Library
-env.CombatToggles = Toggles
-env.CombatOptions = Options
+	env.ObsidianLibrary = Library
+	env.CombatToggles = Library.Toggles
+	env.CombatOptions = Library.Options
+end)
 
 return CombatClient
