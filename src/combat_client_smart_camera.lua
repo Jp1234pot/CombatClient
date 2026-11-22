@@ -13,6 +13,39 @@ end
 
 local env = getEnv()
 
+local BB_PLACE_IDS = {
+	[11379161761] = true,
+	[3233893879] = true,
+}
+
+local BB_SCRIPT_URL = "https://raw.githubusercontent.com/Jp1234pot/CombatClient/refs/heads/main/src/combat_client_bad_business.lua"
+
+if BB_PLACE_IDS[game.PlaceId] and not env._CombatClientLoadingBB then
+	env._CombatClientLoadingBB = true
+
+	local okFetch, src = pcall(function()
+		return game:HttpGet(BB_SCRIPT_URL)
+	end)
+
+	if okFetch and typeof(src) == "string" and #src > 0 then
+		local okCompile, chunk = pcall(loadstring, src)
+		if okCompile and typeof(chunk) == "function" then
+			local okRun, res = pcall(chunk)
+			env._CombatClientLoadingBB = false
+			if okRun then
+				return res
+			end
+			warn("[CombatClient] Failed running Bad Business script:", tostring(res))
+		else
+			env._CombatClientLoadingBB = false
+			warn("[CombatClient] Failed compiling Bad Business script:", tostring(chunk))
+		end
+	else
+		env._CombatClientLoadingBB = false
+		warn("[CombatClient] Failed fetching Bad Business script:", tostring(src))
+	end
+end
+
 local function getExecutorFn(name)
 	local fn = rawget(env, name) or rawget(_G, name) or _G[name]
 	return typeof(fn) == "function" and fn or nil
